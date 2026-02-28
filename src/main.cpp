@@ -2,12 +2,13 @@
  * AS7343 14-Channel Spectral Logger
  * For GY-AS734x breakout board (bare I2C, non-Qwiic)
  *
- * Wiring (GY-AS734x → MCU):
- *   VCC → 3.3V  (DO NOT use 5V — sensor is 1.8V/3.3V only!)
- *   GND → GND
- *   SDA → SDA pin
- *   SCL → SCL pin
- *   INT → optional, not used here
+ * Wiring (GY-AS734x → ESP32):
+ *   VCC  → 3.3V  (DO NOT use 5V — sensor is 3.3V only!)
+ *   GND  → GND
+ *   SDA  → GPIO 21
+ *   SCL  → GPIO 22
+ *   GAIN → 3.3V
+ *   INT  → GPIO 23 (optional, not used here)
  *
  * Output: CSV over Serial at 115200 baud
  * Columns: timestamp_ms,
@@ -151,9 +152,9 @@ void setup() {
     while (true) delay(10);
   }
 
-  Serial.print(F("# Part ID: 0x"));   Serial.println(sensor.getPartID(),      HEX);
-  Serial.print(F("# Rev ID:  0x"));   Serial.println(sensor.getRevisionID(),  HEX);
-  Serial.print(F("# Aux ID:  0x"));   Serial.println(sensor.getAuxID(),       HEX);
+  Serial.print(F("# Part ID: 0x"));  Serial.println(sensor.getPartID(),     HEX);
+  Serial.print(F("# Rev ID:  0x"));  Serial.println(sensor.getRevisionID(), HEX);
+  Serial.print(F("# Aux ID:  0x"));  Serial.println(sensor.getAuxID(),      HEX);
 
   sensor.setGain(GAIN);
   sensor.setATIME(ATIME);
@@ -161,7 +162,7 @@ void setup() {
   sensor.setSMUXMode(AS7343_SMUX_18CH);
 
   sensor.setLEDCurrent(LED_CURRENT_MA);
-  sensor.enableLED(true);   // stays on for the lifetime of the sketch
+  sensor.enableLED(true);  // stays on for the lifetime of the sketch
 
   Serial.print(F("# LED current: "));
   Serial.print(LED_CURRENT_MA);
@@ -170,8 +171,31 @@ void setup() {
   Serial.print(F("# Integration time: "));
   Serial.print(sensor.getIntegrationTime(), 2);
   Serial.println(F(" ms"));
-  Serial.print(sensor.getIntegrationTime(), 2);
-  Serial.println(F(" ms"));
+
+  // ── Channel presence check ────────────────────────────────────────────────
+  // Runs once at startup — point the sensor at a light source.
+  // Any channel stuck at 0 regardless of lighting is likely not
+  // physically present on this board variant.
+  Serial.println(F("# Channel check (point sensor at a light source):"));
+  uint16_t ch[18];
+  if (sensor.readAllChannels(ch)) {
+    Serial.print(F("#   F1  405nm = ")); Serial.println(ch[AS7343_CHANNEL_F1]);
+    Serial.print(F("#   F2  425nm = ")); Serial.println(ch[AS7343_CHANNEL_F2]);
+    Serial.print(F("#   FZ  450nm = ")); Serial.println(ch[AS7343_CHANNEL_FZ]);
+    Serial.print(F("#   F3  475nm = ")); Serial.println(ch[AS7343_CHANNEL_F3]);
+    Serial.print(F("#   F4  515nm = ")); Serial.println(ch[AS7343_CHANNEL_F4]);
+    Serial.print(F("#   F5  550nm = ")); Serial.println(ch[AS7343_CHANNEL_F5]);
+    Serial.print(F("#   FY  555nm = ")); Serial.println(ch[AS7343_CHANNEL_FY]);
+    Serial.print(F("#   FXL 600nm = ")); Serial.println(ch[AS7343_CHANNEL_FXL]);
+    Serial.print(F("#   F6  640nm = ")); Serial.println(ch[AS7343_CHANNEL_F6]);
+    Serial.print(F("#   F7  690nm = ")); Serial.println(ch[AS7343_CHANNEL_F7]);
+    Serial.print(F("#   F8  745nm = ")); Serial.println(ch[AS7343_CHANNEL_F8]);
+    Serial.print(F("#   NIR 855nm = ")); Serial.println(ch[AS7343_CHANNEL_NIR]);
+    Serial.print(F("#   VIS_TL    = ")); Serial.println(ch[AS7343_CHANNEL_VIS_TL_0]);
+    Serial.print(F("#   VIS_BR    = ")); Serial.println(ch[AS7343_CHANNEL_VIS_BR_0]);
+  } else {
+    Serial.println(F("# Channel check failed — sensor may not be ready"));
+  }
 
   Serial.println(F("# Lines prefixed '#' are comments — safe to filter in your CSV parser."));
   Serial.println();

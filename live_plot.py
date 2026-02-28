@@ -1,5 +1,5 @@
 """
-AS7343 Real-Time Spectral Plotter
+AS7343 Real-Time Spectral Plotter — Full Channel Display
 Matches CSV output from main.cpp (PlatformIO firmware)
 
 CSV column order:
@@ -8,22 +8,22 @@ CSV column order:
   FY_555nm, FXL_600nm, F6_640nm, F7_690nm, F8_745nm, NIR_855nm,
   VIS_clear, R_approx, G_approx, B_approx
 
-LED is always ON — continuous mode, no ambient subtraction.
-
 Usage:
-  python spectral_plotter.py            # uses COM5 / /dev/ttyUSB0 default
+  python spectral_plotter.py            # defaults to COM5 / /dev/ttyUSB0
   python spectral_plotter.py COM3
   python spectral_plotter.py /dev/ttyACM0
 
 Requirements:
-  pip install pyserial matplotlib
+  pip install pyserial matplotlib numpy
 """
 
 import sys
 import serial
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+import matplotlib.ticker as ticker
+import numpy as np
 from collections import deque
 import time
 
@@ -31,34 +31,38 @@ import time
 
 PORT        = sys.argv[1] if len(sys.argv) > 1 else ("COM5" if sys.platform == "win32" else "/dev/ttyUSB0")
 BAUD        = 115200
-HISTORY_LEN = 60   # number of past readings shown in the trend lines
+HISTORY_LEN = 120   # rolling history length (frames)
+SAVE_CSV    = True  # set False to disable saving
+CSV_FILE    = "spectral_log.csv"
 
-# ── Channel definitions (wavelength order, matching firmware CSV) ─────────────
-# (data_field_index, label, wavelength_nm, RGB_color)
-# data_field_index is 0-based after timestamp and LED_state columns
-
+# ── Channel definitions ───────────────────────────────────────────────────────
+# (csv_index, label, wavelength_nm, hex_color)
 CHANNELS = [
-    (0,  "F1",  405, (0.45, 0.00, 0.90)),   # violet
-    (1,  "F2",  425, (0.25, 0.00, 1.00)),   # violet-blue
-    (2,  "FZ",  450, (0.00, 0.20, 1.00)),   # blue
-    (3,  "F3",  475, (0.00, 0.60, 1.00)),   # blue-cyan
-    (4,  "F4",  515, (0.00, 0.85, 0.30)),   # green
-    (5,  "F5",  550, (0.40, 0.95, 0.00)),   # green-yellow
-    (6,  "FY",  555, (0.60, 1.00, 0.00)),   # yellow-green
-    (7,  "FXL", 600, (1.00, 0.65, 0.00)),   # orange
-    (8,  "F6",  640, (1.00, 0.20, 0.00)),   # red
-    (9,  "F7",  690, (0.85, 0.00, 0.00)),   # deep red
-    (10, "F8",  745, (0.55, 0.00, 0.00)),   # near-IR
-    (11, "NIR", 855, (0.30, 0.00, 0.20)),   # NIR
+    (0,  "F1",  405, "#9B30FF"),
+    (1,  "F2",  425, "#6A0FFF"),
+    (2,  "FZ",  450, "#1E3FFF"),
+    (3,  "F3",  475, "#0094FF"),
+    (4,  "F4",  515, "#00C44F"),
+    (5,  "F5",  550, "#7ED600"),
+    (6,  "FY",  555, "#AADD00"),
+    (7,  "FXL", 600, "#FF9900"),
+    (8,  "F6",  640, "#FF2200"),
+    (9,  "F7",  690, "#CC0000"),
+    (10, "F8",  745, "#880000"),
+    (11, "NIR", 855, "#440033"),
 ]
 
-# CSV data-field indices for derived channels
 IDX_VIS = 12
 IDX_R   = 13
 IDX_G   = 14
 IDX_B   = 15
 
-# ── Serial connection ─────────────────────────────────────────────────────────
+LABELS  = [f"{lbl}\n{wl}nm" for _, lbl, wl, _ in CHANNELS]
+COLORS  = [c for _, _, _, c in CHANNELS]
+N_CH    = len(CHANNELS)
+x_pos   = np.arange(N_CH)
+
+# ── Serial ────────────────────────────────────────────────────────────────────
 
 print(f"Connecting to {PORT} @ {BAUD} baud ...")
 try:
@@ -68,113 +72,151 @@ except serial.SerialException as e:
     sys.exit(1)
 print("Connected. Waiting for data ...\n")
 
+# ── CSV logging ───────────────────────────────────────────────────────────────
+
+csv_file = None
+if SAVE_CSV:
+    csv_file = open(CSV_FILE, "w")
+    csv_file.write("timestamp_ms,"
+                   "F1_405nm,F2_425nm,FZ_450nm,F3_475nm,"
+                   "F4_515nm,F5_550nm,FY_555nm,FXL_600nm,"
+                   "F6_640nm,F7_690nm,F8_745nm,NIR_855nm,"
+                   "VIS_clear,R_approx,G_approx,B_approx\n")
+    print(f"Logging to {CSV_FILE}")
+
 # ── History buffers ───────────────────────────────────────────────────────────
 
-history     = {idx: deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN) for idx, *_ in CHANNELS}
-ts_history  = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
+history  = {idx: deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN) for idx, *_ in CHANNELS}
+vis_hist = deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN)
 
-last_vals = {idx: 0 for idx, *_ in CHANNELS}
+last_vals = {idx: 0.0 for idx, *_ in CHANNELS}
 last_R = last_G = last_B = last_VIS = 0.0
 
-# ── Figure layout ─────────────────────────────────────────────────────────────
+# ── Figure ────────────────────────────────────────────────────────────────────
 
 plt.style.use("dark_background")
-fig = plt.figure(figsize=(14, 9), facecolor="#0d0d0d")
-fig.canvas.manager.set_window_title("AS7343 Live Spectral Monitor")
+fig = plt.figure(figsize=(16, 10), facecolor="#080808")
+fig.canvas.manager.set_window_title("AS7343 — Full Spectral Monitor")
 
 gs = gridspec.GridSpec(
-    3, 2,
+    4, 3,
     figure=fig,
-    left=0.07, right=0.97,
-    top=0.88,  bottom=0.10,
-    hspace=0.55, wspace=0.35,
+    left=0.06, right=0.97,
+    top=0.91,  bottom=0.07,
+    hspace=0.65, wspace=0.38,
 )
 
-ax_bar   = fig.add_subplot(gs[0:2, 0])   # main spectrum bar chart
-ax_diff  = fig.add_subplot(gs[2,   0])   # LED-on minus ambient
-ax_trend = fig.add_subplot(gs[0:2, 1])   # rolling trend lines
-ax_rgb   = fig.add_subplot(gs[2,   1])   # RGB colour swatch
+ax_bar   = fig.add_subplot(gs[0:2, 0:2])   # main bar chart — wide
+ax_rgb   = fig.add_subplot(gs[0:2, 2])     # colour swatch
+ax_trend = fig.add_subplot(gs[2:4, 0:2])   # all-channel trend
+ax_vis   = fig.add_subplot(gs[2:4, 2])     # VIS broadband + stats
 
-bar_labels = [f"{lbl}\n{wl}nm" for _, lbl, wl, _ in CHANNELS]
-bar_colors = [c for *_, c in CHANNELS]
-x_pos      = list(range(len(CHANNELS)))
+def style_ax(ax, title, ylabel):
+    ax.set_facecolor("#0e0e0e")
+    ax.set_title(title, fontsize=10, color="#dddddd", pad=5, fontweight="bold")
+    ax.set_ylabel(ylabel, fontsize=8, color="#999999")
+    ax.tick_params(colors="#777777", labelsize=7.5)
+    for sp in ax.spines.values():
+        sp.set_edgecolor("#2a2a2a")
 
-# ── Bar chart (LED ON spectrum) ───────────────────────────────────────────────
-bars_on = ax_bar.bar(x_pos, [0] * len(CHANNELS), color=bar_colors,
-                     width=0.6, edgecolor="#ffffff22", linewidth=0.5)
+# ── Bar chart ─────────────────────────────────────────────────────────────────
+
+bars = ax_bar.bar(x_pos, [0] * N_CH, color=COLORS,
+                  width=0.65, edgecolor="#00000055", linewidth=0.8, zorder=3)
 ax_bar.set_xticks(x_pos)
-ax_bar.set_xticklabels(bar_labels, fontsize=7.5, rotation=45, ha="right")
-ax_bar.set_ylabel("ADC counts", fontsize=9, color="#cccccc")
-ax_bar.set_title("Live Spectrum (LED ON)", fontsize=11, color="#ffffff", pad=6)
-ax_bar.tick_params(colors="#aaaaaa", labelsize=8)
-ax_bar.set_facecolor("#111111")
-for sp in ax_bar.spines.values():
-    sp.set_edgecolor("#333333")
+ax_bar.set_xticklabels(LABELS, fontsize=7.5, rotation=0, ha="center")
+style_ax(ax_bar, "Live Spectrum — All 12 Spectral Channels", "ADC counts")
 
-# ── Difference chart (ON - ambient) ──────────────────────────────────────────
-bars_diff = ax_diff.bar(x_pos, [0] * len(CHANNELS), color=bar_colors,
-                        width=0.6, edgecolor="#ffffff22", linewidth=0.5)
-ax_diff.set_xticks(x_pos)
-ax_diff.set_xticklabels(bar_labels, fontsize=7.5, rotation=45, ha="right")
-ax_diff.set_ylabel("ON - ambient", fontsize=9, color="#cccccc")
-ax_diff.set_title("Frame-to-frame delta (current - previous)", fontsize=9, color="#aaaaaa", pad=4)
-ax_diff.axhline(0, color="#555555", linewidth=0.8)
-ax_diff.tick_params(colors="#aaaaaa", labelsize=8)
-ax_diff.set_facecolor("#111111")
-for sp in ax_diff.spines.values():
-    sp.set_edgecolor("#333333")
+# Value labels above each bar
+bar_val_texts = [
+    ax_bar.text(xi, 0, "", ha="center", va="bottom",
+                fontsize=7, color="#cccccc", zorder=5)
+    for xi in x_pos
+]
 
-# ── Trend lines ───────────────────────────────────────────────────────────────
-ax_trend.set_facecolor("#111111")
-ax_trend.set_title(f"Rolling trend (last {HISTORY_LEN} LED-ON readings)", fontsize=10,
-                   color="#ffffff", pad=6)
-ax_trend.set_ylabel("ADC counts", fontsize=9, color="#cccccc")
-ax_trend.tick_params(colors="#aaaaaa", labelsize=8)
-for sp in ax_trend.spines.values():
-    sp.set_edgecolor("#333333")
+# Smooth envelope line
+env_x = np.linspace(0, N_CH - 1, 300)
+env_line, = ax_bar.plot([], [], color="#ffffff30", linewidth=1.5, zorder=2)
+env_fill_container = [None]
 
-t_x = list(range(HISTORY_LEN))
-# Subset of channels for legible trend plot
-TREND_INDICES = [0, 2, 4, 6, 8, 10, 11]   # F1, FZ, F4, FY, F6, F8, NIR
-trend_lines = {}
-for idx, lbl, wl, col in CHANNELS:
-    if idx in TREND_INDICES:
-        (ln,) = ax_trend.plot(t_x, list(history[idx]),
-                              color=col, linewidth=1.4, alpha=0.9,
-                              label=f"{lbl} {wl}nm")
-        trend_lines[idx] = ln
+# Peak indicator
+peak_marker, = ax_bar.plot([], [], marker="v", color="#ffdd00",
+                            markersize=8, linestyle="none", zorder=6)
+peak_text = ax_bar.text(0, 0, "", ha="center", va="top",
+                         fontsize=8, color="#ffdd00", fontweight="bold", zorder=6)
 
-ax_trend.legend(loc="upper left", fontsize=7, framealpha=0.25,
-                labelcolor="white", facecolor="#1a1a1a")
+# ── Colour swatch ─────────────────────────────────────────────────────────────
 
-# ── RGB swatch ────────────────────────────────────────────────────────────────
-ax_rgb.set_facecolor("#111111")
+ax_rgb.set_facecolor("#0e0e0e")
+ax_rgb.set_title("Approximate Object Colour", fontsize=10,
+                  color="#dddddd", pad=5, fontweight="bold")
 ax_rgb.set_xlim(0, 1)
 ax_rgb.set_ylim(0, 1)
 ax_rgb.set_xticks([])
 ax_rgb.set_yticks([])
-ax_rgb.set_title("Approximate object colour", fontsize=10, color="#ffffff", pad=6)
 for sp in ax_rgb.spines.values():
-    sp.set_edgecolor("#333333")
+    sp.set_edgecolor("#2a2a2a")
 
-swatch = mpatches.FancyBboxPatch((0.05, 0.15), 0.9, 0.70,
-                                  boxstyle="round,pad=0.02",
-                                  facecolor=(0, 0, 0), edgecolor="#555555",
-                                  linewidth=1.5, transform=ax_rgb.transAxes,
-                                  clip_on=False)
-ax_rgb.add_patch(swatch)
+def make_swatch(ax, xy, wh, ec="#444444"):
+    p = mpatches.FancyBboxPatch(xy, *wh,
+        boxstyle="round,pad=0.02", facecolor=(0,0,0),
+        edgecolor=ec, linewidth=1.0,
+        transform=ax.transAxes, clip_on=False)
+    ax.add_patch(p)
+    return p
 
-rgb_text = ax_rgb.text(0.5, 0.08, "R=0  G=0  B=0",
-                        transform=ax_rgb.transAxes, ha="center", va="bottom",
-                        fontsize=9, color="#aaaaaa")
-vis_text = ax_rgb.text(0.5, 0.93, "VIS=0",
-                        transform=ax_rgb.transAxes, ha="center", va="top",
-                        fontsize=9, color="#777777")
+swatch_main = make_swatch(ax_rgb, (0.08, 0.32), (0.84, 0.52), "#555555")
+swatch_r    = make_swatch(ax_rgb, (0.08, 0.14), (0.24, 0.13))
+swatch_g    = make_swatch(ax_rgb, (0.38, 0.14), (0.24, 0.13))
+swatch_b    = make_swatch(ax_rgb, (0.68, 0.14), (0.24, 0.13))
 
-# ── Super-title ───────────────────────────────────────────────────────────────
-status_text = fig.text(0.5, 0.955, "Waiting for data...",
-                        ha="center", va="top", fontsize=12,
-                        color="#dddddd", fontweight="bold")
+rgb_label = ax_rgb.text(0.5, 0.88, "R=0  G=0  B=0",
+    transform=ax_rgb.transAxes, ha="center", va="center",
+    fontsize=9, color="#cccccc", fontweight="bold")
+vis_label = ax_rgb.text(0.5, 0.05, "VIS = 0",
+    transform=ax_rgb.transAxes, ha="center", va="bottom",
+    fontsize=8.5, color="#666666")
+for x_lbl, ch_lbl in zip([0.20, 0.50, 0.80], ["R", "G", "B"]):
+    ax_rgb.text(x_lbl, 0.21, ch_lbl, transform=ax_rgb.transAxes,
+                ha="center", va="center", fontsize=7, color="#888888")
+
+# ── All-channel trend ─────────────────────────────────────────────────────────
+
+style_ax(ax_trend, f"All Channels — Rolling History ({HISTORY_LEN} frames)", "ADC counts")
+ax_trend.set_xlabel("Frame", fontsize=8, color="#777777")
+t_x = list(range(HISTORY_LEN))
+trend_lines = {}
+for idx, lbl, wl, col in CHANNELS:
+    (ln,) = ax_trend.plot(t_x, list(history[idx]),
+                          color=col, linewidth=1.1, alpha=0.9,
+                          label=f"{lbl} {wl}nm")
+    trend_lines[idx] = ln
+
+ax_trend.legend(
+    loc="upper left", fontsize=6.5, framealpha=0.3,
+    labelcolor="white", facecolor="#111111",
+    ncol=4, handlelength=1.2, columnspacing=0.8
+)
+
+# ── VIS trend + stats ─────────────────────────────────────────────────────────
+
+style_ax(ax_vis, "VIS Broadband Trend", "ADC counts")
+ax_vis.set_xlabel("Frame", fontsize=8, color="#777777")
+vis_line, = ax_vis.plot(t_x, list(vis_hist), color="#bbbbbb", linewidth=1.3)
+vis_fill_container = [ax_vis.fill_between(t_x, list(vis_hist),
+                                           alpha=0.12, color="#bbbbbb")]
+
+stats_text = ax_vis.text(0.97, 0.97, "",
+    transform=ax_vis.transAxes, ha="right", va="top",
+    fontsize=7.5, color="#aaaaaa",
+    bbox=dict(facecolor="#111111", edgecolor="#333333",
+              boxstyle="round,pad=0.4", alpha=0.85))
+
+# ── Status bar ────────────────────────────────────────────────────────────────
+
+status_text = fig.text(0.5, 0.965, "Waiting for data...",
+    ha="center", va="top", fontsize=11,
+    color="#cccccc", fontweight="bold")
 
 plt.ion()
 plt.show()
@@ -182,16 +224,13 @@ plt.show()
 # ── Parsing ───────────────────────────────────────────────────────────────────
 
 def parse_line(line):
-    """Return (timestamp_ms, data_fields) or None on bad/comment lines."""
     if not line or line.startswith("#") or "timestamp" in line:
         return None
     parts = line.split(",")
-    if len(parts) < 17:   # timestamp + 16 data fields
+    if len(parts) < 17:
         return None
     try:
-        ts   = int(parts[0])
-        data = [float(p) for p in parts[1:]]
-        return ts, data
+        return int(parts[0]), [float(p) for p in parts[1:]]
     except ValueError:
         return None
 
@@ -209,56 +248,89 @@ try:
 
         ts, data = parsed
 
-        # Save previous values for frame delta
-        prev_vals = dict(last_vals)
+        if csv_file:
+            csv_file.write(raw + "\n")
+            csv_file.flush()
 
+        # Update state
         for idx, *_ in CHANNELS:
             last_vals[idx] = data[idx]
             history[idx].append(data[idx])
+
         last_R   = data[IDX_R]
         last_G   = data[IDX_G]
         last_B   = data[IDX_B]
         last_VIS = data[IDX_VIS]
-        ts_history.append(ts / 1000.0)
+        vis_hist.append(last_VIS)
 
-        # Bar chart
+        # ── Bar chart ─────────────────────────────────────────────────────────
         cur_vals = [last_vals[idx] for idx, *_ in CHANNELS]
         max_val  = max(max(cur_vals), 1)
-        for bar, h in zip(bars_on, cur_vals):
+        peak_idx = int(np.argmax(cur_vals))
+
+        for bar, h, txt in zip(bars, cur_vals, bar_val_texts):
             bar.set_height(h)
-        ax_bar.set_ylim(0, max_val * 1.15)
+            txt.set_position((bar.get_x() + bar.get_width() / 2, h * 1.02))
+            txt.set_text(str(int(h)))
 
-        # Frame-to-frame delta
-        diff_vals = [last_vals[idx] - prev_vals[idx] for idx, *_ in CHANNELS]
-        max_diff  = max(max(abs(v) for v in diff_vals), 1)
-        for bar, h in zip(bars_diff, diff_vals):
-            bar.set_height(h)
-        ax_diff.set_ylim(-max_diff * 1.2, max_diff * 1.2)
+        ax_bar.set_ylim(0, max_val * 1.35)
 
-        # Trend lines
-        for idx in TREND_INDICES:
-            trend_lines[idx].set_ydata(list(history[idx]))
-        trend_max = max(
-            (max(history[idx]) for idx in TREND_INDICES if max(history[idx]) > 0),
-            default=1
-        )
-        ax_trend.set_ylim(0, trend_max * 1.15)
+        # Envelope
+        interp_y = np.interp(env_x, x_pos, cur_vals)
+        env_line.set_data(env_x, interp_y)
+        if env_fill_container[0] is not None:
+            env_fill_container[0].remove()
+        env_fill_container[0] = ax_bar.fill_between(
+            env_x, interp_y, alpha=0.07, color="#ffffff", zorder=1)
 
-        # RGB swatch
+        # Peak marker
+        peak_marker.set_data([peak_idx], [max_val * 1.22])
+        peak_text.set_position((peak_idx, max_val * 1.32))
+        peak_text.set_text(f"Peak: {CHANNELS[peak_idx][1]} {CHANNELS[peak_idx][2]}nm = {int(max_val)}")
+
+        # ── Colour swatch ─────────────────────────────────────────────────────
         denom = max(last_R, last_G, last_B, 1.0)
         nr, ng, nb = last_R / denom, last_G / denom, last_B / denom
-        swatch.set_facecolor((nr, ng, nb))
-        rgb_text.set_text(f"R={last_R:.0f}  G={last_G:.0f}  B={last_B:.0f}")
-        vis_text.set_text(f"VIS clear = {last_VIS:.0f}")
+        swatch_main.set_facecolor((nr, ng, nb))
+        swatch_r.set_facecolor((nr, 0, 0))
+        swatch_g.set_facecolor((0, ng, 0))
+        swatch_b.set_facecolor((0, 0, nb))
+        rgb_label.set_text(f"R={last_R:.0f}  G={last_G:.0f}  B={last_B:.0f}")
+        vis_label.set_text(f"VIS = {last_VIS:.0f}")
 
-        # Status bar
+        # ── All-channel trend ─────────────────────────────────────────────────
+        trend_max = 1
+        for idx, *_ in CHANNELS:
+            ydata = list(history[idx])
+            trend_lines[idx].set_ydata(ydata)
+            trend_max = max(trend_max, max(ydata))
+        ax_trend.set_ylim(0, trend_max * 1.15)
+
+        # ── VIS trend ─────────────────────────────────────────────────────────
+        vis_data = list(vis_hist)
+        vis_line.set_ydata(vis_data)
+        vis_fill_container[0].remove()
+        vis_fill_container[0] = ax_vis.fill_between(
+            t_x, vis_data, alpha=0.12, color="#bbbbbb")
+        ax_vis.set_ylim(0, max(max(vis_data), 1) * 1.20)
+
+        vis_arr = np.array(vis_data)
+        stats_text.set_text(
+            f"min   {vis_arr.min():.0f}\n"
+            f"max   {vis_arr.max():.0f}\n"
+            f"mean {vis_arr.mean():.1f}\n"
+            f"std    {vis_arr.std():.1f}"
+        )
+
+        # ── Status ────────────────────────────────────────────────────────────
         frame_count += 1
-        elapsed = time.time() - t_start
-        fps     = frame_count / elapsed if elapsed > 0 else 0
+        fps = frame_count / (time.time() - t_start)
         status_text.set_text(
-            f"t = {ts / 1000:.1f} s   "
-            f"Peak = {max_val:.0f}   "
+            f"AS7343  |  t = {ts/1000:.1f} s  |  "
+            f"Peak: {CHANNELS[peak_idx][1]} {CHANNELS[peak_idx][2]}nm = {int(max_val)}  |  "
+            f"VIS = {last_VIS:.0f}  |  "
             f"Frame {frame_count}  ({fps:.1f} fps)"
+            + ("  [saving]" if csv_file else "")
         )
 
         fig.canvas.draw()
@@ -268,4 +340,7 @@ except KeyboardInterrupt:
     print("\nStopped by user.")
 finally:
     ser.close()
+    if csv_file:
+        csv_file.close()
+        print(f"Data saved to {CSV_FILE}")
     print("Serial port closed.")
